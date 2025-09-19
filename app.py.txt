@@ -1,0 +1,195 @@
+# app.py - Flask backend for NYC Taxi Fare Prediction with SHAP explanations
+
+from flask import Flask, request, jsonify, render_template  # Flask web framework
+import joblib  # For loading trained ML model
+import pandas as pd  # For data handling
+import numpy as np  # For numerical operations
+from datetime import datetime  # For extracting datetime features
+import shap  # For model interpretability
+import requests  # For geocoding user input locations
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# --- NYC Bounding Box ---
+# We restrict predictions only to New York City's 5 boroughs
+NYC_BOUNDS = {
+    "min_lat": 40.4774,   # Southernmost point (Staten Island)
+    "max_lat": 40.9176,   # Northernmost point (Bronx)
+    "min_lon": -74.2591,  # Westernmost point
+    "max_lon": -73.7004   # Easternmost point
+}
+
+def is_within_nyc(lat, lon):
+    """
+    Checks whether the given latitude and longitude are within NYC bounds.
+    """
+    return NYC_BOUNDS["min_lat"] <= lat <= NYC_BOUNDS["max_lat"] and NYC_BOUNDS["min_lon"] <= lon <= NYC_BOUNDS["max_lon"]
+
+# --- Load ML Model & SHAP Explainer ---
+print("Loading the trained model and SHAP explainer...")
+try:
+    # Load the trained XGBoost model
+    model = joblib.load('xgb_model_final.pkl')
+
+    # SHAP Explainer automatically supports XGBoost and LightGBM
+    explainer = shap.Explainer(model)
+    print("Model and explainer loaded successfully.")
+except FileNotFoundError:
+    print("\n--- ERROR: Model file 'xgb_model_final.pkl' not found. Exiting. ---")
+    exit()
+
+# --- Geocoding Function ---
+def get_coords(location_name):
+    """
+    Converts a location name into latitude and longitude using OpenStreetMap Nominatim API.
+    """
+    try:
+        url = f"https://nominatim.openstreetmap.org/search?q={location_name}, New York&format=json"
+        headers = {'User-Agent': 'FairFareAI/1.0'}
+        response = requests.get(url, headers=headers, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+
+        if data:
+            return {
+                "latitude": float(data[0]["lat"]),
+                "longitude": float(data[0]["lon"])
+            }
+    except Exception as e:
+        print(f"Geocoding error for '{location_name}': {e}")
+    return None
+
+# --- Feature Engineering Function ---
+def prepare_features(ride_details):
+    """
+    Takes structured ride details and generates model-ready features.
+    """
+    df = pd.DataFrame([ride_details])  # Convert to DataFrame for processing
+
+    # Extract datetime features from current server time
+    pickup_datetime = datetime.now()
+    df['pickup_datetime_year'] = pickup_datetime.year
+    df['pickup_datetime_month'] = pickup_datetime.month
+    df['pickup_datetime_day'] = pickup_datetime.day
+    df['pickup_datetime_weekday'] = pickup_datetime.weekday()
+    df['pickup_datetime_hour'] = pickup_datetime.hour
+
+    # Haversine distance between pickup and dropoff
+    lon1, lat1, lon2, lat2 = map(np.radians, [
+        df['pickup_longitude'], df['pickup_latitude'],
+        df['dropoff_longitude'], df['dropoff_latitude']
+    ])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat / 2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    df['trip_distance'] = 6371 * c  # Earth radius in km
+
+    # Add distance to key landmarks (used as model features)
+    landmarks = {
+        'jfk': (-73.7781, 40.6413),
+        'lga': (-73.8740, 40.7769),
+        'ewr': (-74.1745, 40.6895),
+        'met': (-73.9632, 40.7794),
+        'wtc': (-74.0099, 40.7126)
+    }
+
+    for name, (lon, lat) in landmarks.items():
+        lon1_land, lat1_land, lon2_land, lat2_land = map(np.radians, [
+            lon, lat, df['dropoff_longitude'], df['dropoff_latitude']
+        ])
+        dlon_land = lon2_land - lon1_land
+        dlat_land = lat2_land - lat1_land
+        a_land = np.sin(dlat_land/2.0)**2 + np.cos(lat1_land) * np.cos(lat2_land) * np.sin(dlon_land/2.0)**2
+        c_land = 2 * np.arcsin(np.sqrt(a_land))
+        df[name + '_drop_distance'] = 6371 * c_land  # in km
+
+    # Final list of features used in model training
+    feature_cols = [
+        'pickup_longitude', 'pickup_latitude', 'dropoff_longitude', 'dropoff_latitude',
+        'passenger_count', 'pickup_datetime_year', 'pickup_datetime_month',
+        'pickup_datetime_day', 'pickup_datetime_weekday', 'pickup_datetime_hour',
+        'trip_distance', 'jfk_drop_distance', 'lga_drop_distance',
+        'ewr_drop_distance', 'met_drop_distance', 'wtc_drop_distance'
+    ]
+    return df[feature_cols]
+
+# --- Home Route (optional) ---
+@app.route('/')
+def home():
+    """
+    Serves the homepage (if you have a frontend).
+    """
+    return render_template('index.html')
+
+# --- Prediction API ---
+@app.route('/predict', methods=['POST'])
+def predict():
+    """
+    Receives ride input (pickup/dropoff), geocodes it, validates, predicts fare, and returns SHAP breakdown.
+    """
+    try:
+        # Step 1: Get input from frontend or client
+        data = request.get_json()
+        pickup_name = data.get('pickup_location')
+        dropoff_name = data.get('dropoff_location')
+        passenger_count = int(data.get('passenger_count', 1))
+
+        # Step 2: Geocode pickup & dropoff names to lat/lon
+        pickup_coords = get_coords(pickup_name)
+        dropoff_coords = get_coords(dropoff_name)
+
+        if not pickup_coords or not dropoff_coords:
+            return jsonify({'error': 'Could not find one or both locations. Please be more specific.'}), 400
+
+        # Step 3: Restrict only to NYC valid coordinates
+        if not is_within_nyc(pickup_coords["latitude"], pickup_coords["longitude"]) or not is_within_nyc(dropoff_coords["latitude"], dropoff_coords["longitude"]):
+            return jsonify({'error': 'The location(s) entered are outside New York City. Please enter valid NYC locations only.'}), 400
+
+        # Step 4: Create structured ride details
+        ride_details = {
+            'pickup_latitude': pickup_coords['latitude'],
+            'pickup_longitude': pickup_coords['longitude'],
+            'dropoff_latitude': dropoff_coords['latitude'],
+            'dropoff_longitude': dropoff_coords['longitude'],
+            'passenger_count': passenger_count
+        }
+
+        # Step 5: Generate features & predict
+        features = prepare_features(ride_details)
+        prediction = float(model.predict(features)[0])  # Predicted fare
+
+        # Step 6: Get SHAP explanation
+        shap_result = explainer(features)
+        shap_values = shap_result.values[0] if isinstance(shap_result, shap.Explanation) else explainer.shap_values(features)[0]
+        base_value = shap_result.base_values[0] if hasattr(shap_result, 'base_values') else explainer.expected_value[0]
+
+        # Utility function to extract contribution of specific feature
+        def get_contrib(feature_name):
+            idx = list(features.columns).index(feature_name)
+            return float(shap_values[idx])
+
+        # Step 7: Extract SHAP components
+        distance_cost = get_contrib('trip_distance')
+        time_cost = get_contrib('pickup_datetime_hour')
+        day_cost = get_contrib('pickup_datetime_weekday')
+        other_costs = prediction - base_value - distance_cost - time_cost - day_cost
+        final_base_fare = base_value + other_costs
+
+        # Step 8: Respond with prediction & SHAP breakdown
+        return jsonify({
+            "predicted_fare": round(prediction, 2),
+            "base_fare": round(final_base_fare, 2),
+            "distance_cost": round(distance_cost, 2),
+            "time_cost": round(time_cost, 2),
+            "day_cost": round(day_cost, 2)
+        })
+
+    except Exception as e:
+        print(f"An error occurred in /predict: {e}")
+        return jsonify({'error': 'An internal error occurred. Please check the server logs.'}), 500
+
+# --- Run server locally (not needed when deployed with gunicorn/docker) ---
+if __name__ == '__main__':
+    app.run(debug=False)
